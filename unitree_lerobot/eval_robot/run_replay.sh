@@ -2,9 +2,9 @@
 # Replay one episode of a LeRobot dataset on H2 + Sharpa.
 #
 # Usage:
-#   bash run_replay.sh                      # episode 0, no gravity comp
-#   bash run_replay.sh --gravity-comp       # same episode with tau_ff = G(q)
-#   bash run_replay.sh --episode 3 --speed 0.5
+#   DATASET_DIR=/path/to/lerobot_dataset bash run_replay.sh                  # episode 0, no gravity comp
+#   DATASET_DIR=... bash run_replay.sh --gravity-comp                           # same episode with tau_ff = G(q)
+#   DATASET_DIR=... bash run_replay.sh --episode 3 --speed 0.5
 #
 # Each run prints a per-joint tracking-error table (measured - target) and saves
 # the raw log to $TRACK_LOG_DIR/replay_track_ep<N>_gc_{on,off}_*.npz, so an
@@ -14,7 +14,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DATASET_DIR="${DATASET_DIR:-$HOME/xr_teleoperate/dataset/trocar_plate_lerobot_v21}"
+if [[ -z "${DATASET_DIR:-}" ]]; then
+    echo "ERROR: set DATASET_DIR=/path/to/lerobot_dataset" >&2
+    exit 1
+fi
 TRACK_LOG_DIR="${TRACK_LOG_DIR:-$HOME/replay_tracking_logs}"
 NETWORK_INTERFACE="${NETWORK_INTERFACE:-eno2}"
 mkdir -p "$TRACK_LOG_DIR"

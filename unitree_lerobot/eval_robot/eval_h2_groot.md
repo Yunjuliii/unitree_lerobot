@@ -44,7 +44,7 @@ on the arms and hands.
 ## Prerequisites (in order)
 
 1. **Boot the robot** and bring up cameras, hands, and standing posture as
-   described in `~/binliu/xr_teleoperate/teleop/docs/startup_procedure.md`
+   described in `~/xr_teleoperate/teleop/docs/startup_procedure.md`
    (steps 1–5).
 2. **Start the Sharpa DDS bridge on Thor:**
    ```bash
@@ -53,7 +53,7 @@ on the arms and hands.
    ```
 3. **Start the GR00T policy server** (in GR00T's uv env, separate terminal):
    ```bash
-   cd /home/nvidia/binliu/Isaac-GR00T
+   cd ~/Isaac-GR00T
    uv run python gr00t/eval/run_gr00t_server.py \
        --model-path /path/to/checkpoint \
        --embodiment-tag new_embodiment \
@@ -63,7 +63,7 @@ on the arms and hands.
    ```bash
    source /opt/ros/jazzy/setup.bash
    conda activate tv
-   cd ~/binliu/unitree_lerobot
+   cd ~/unitree_lerobot
    ```
 
 ## Observation schema
@@ -232,7 +232,7 @@ hands, and image client.
 - **Hand DDS client returns zeros for state** — the C++ bridge isn't running
   on Thor, or it's running on a different DDS domain than `--dds-domain`.
 - **"Tactile sensor not ready" on the bridge side** — see
-  `~/binliu/xr_teleoperate/teleop/docs/sharpa_hands_thor.md`.
+  `~/xr_teleoperate/teleop/docs/sharpa_hands_thor.md`.
 - **Arm doesn't move in motion mode** — the WBC isn't yielding because the
   robot isn't in a state where motion mode is accepted. Confirm step 5 of
   the startup procedure (R2+Y to stand) completed.
@@ -245,11 +245,11 @@ hands, and image client.
 - `eval_h2.py` — earlier, simpler eval script (no GR00T server, no DDS bridge).
 - `replay_h2.py` — replay a recorded LeRobot episode on the same hardware
   setup (same arm / hand abstractions, no policy server).
-- `~/binliu/xr_teleoperate/teleop/utils/ros_image_client.py` — the ROS camera
+- `~/xr_teleoperate/teleop/utils/ros_image_client.py` — the ROS camera
   client this script imports.
-- `~/binliu/xr_teleoperate/teleop/robot_control/robot_hand_sharpa_dds.py` —
+- `~/xr_teleoperate/teleop/robot_control/robot_hand_sharpa_dds.py` —
   the DDS hand client.
-- `~/binliu/xr_teleoperate/teleop/robot_control/robot_arm.py` —
+- `~/xr_teleoperate/teleop/robot_control/robot_arm.py` —
   `H2_ArmController` (motion mode, head control, velocity clipping).
-- `~/binliu/xr_teleoperate/scripts/sharpa_dds_bridge.cpp` — the C++ bridge on
+- `~/xr_teleoperate/scripts/sharpa_dds_bridge.cpp` — the C++ bridge on
   Thor that owns the SDK side and bridges to DDS.
