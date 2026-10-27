@@ -1,0 +1,1632 @@
+"""
+Policy inference on H2 + Sharpa using a remote GR00T policy server.
+
+The GR00T server runs in GR00T's uv environment (separate terminal):
+
+    cd /home/nvidia/binliu/Isaac-GR00T
+    uv run python gr00t/eval/run_gr00t_server.py \\
+        --model-path /path/to/checkpoint \\
+        --embodiment-tag new_embodiment \\
+        --port 5555
+
+This script runs in the tv conda environment (no gr00t package required).
+It communicates via ZMQ using the same msgpack wire format as GR00T's
+PolicyServer / PolicyClient.
+
+Observation keys sent to the server (policy modality names — not always the physical camera side):
+    video.head_right   (H, W, 3) uint8   ← default: physical head LEFT (see --head-eye)
+    video.wrist_left   (H, W, 3) uint8
+    video.wrist_right  (H, W, 3) uint8
+    state.left_arm     (7,)  float32
+    state.right_arm    (7,)  float32
+    state.left_hand    (22,) float32
+    state.right_hand   (22,) float32
+    language.annotation.human.task_description  str
+
+Action chunk returned by the server:
+    left_arm   (B, T, 7)
+    right_arm  (B, T, 7)
+    left_hand  (B, T, 22)
+    right_hand (B, T, 22)
+
+Image source: ROS 2 (CycloneDDS) on the four sensing_h2_ros_gstreamer topics,
+or the legacy ZMQ teleimager server via `--image-source zmq`.
+
+Hand control: through the C++ sharpa_dds_bridge on Thor (default), or the
+direct Sharpa SDK on the local machine via `--hands-source sdk`.
+
+Usage:
+    # Standing replay, ROS cameras, DDS bridge for hands:
+    python unitree_lerobot/eval_robot/eval_h2_groot.py \\
+        --policy-host localhost --policy-port 5555 \\
+        --task "pick up the apple" \\
+        --motion
+
+    # Fill video.head_right from the left head camera instead:
+    python unitree_lerobot/eval_robot/eval_h2_groot.py \\
+        --policy-host localhost --task "..." --head-eye left
+
+    # Arm only (no hands), legacy ZMQ image server:
+    python unitree_lerobot/eval_robot/eval_h2_groot.py \\
+        --policy-host localhost --no-hands \\
+        --image-source zmq --img-server-ip 192.168.124.162
+"""
+
+import argparse
+import io
+import json
+import math
+import os
+import sys
+import threading
+import time
+
+import msgpack
+import msgpack_numpy as msgpack_np
+import numpy as np
+
+# ── paths ─────────────────────────────────────────────────────────────────────
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _resolve_xr_root() -> str:
+    """Locate xr_teleoperate so gravity-comp can import H2_ArmIK."""
+    candidates = [
+        os.environ.get("XR_TELEOPERATE_ROOT"),
+        os.path.join(os.path.dirname(_REPO_ROOT), "xr_teleoperate"),
+        os.path.expanduser("~/Fanxing/xr_teleoperate"),
+        os.path.expanduser("~/workspace/xr_teleoperate"),
+        os.path.expanduser("~/binliu/xr_teleoperate"),
+    ]
+    seen: set[str] = set()
+    for path in candidates:
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        if os.path.isdir(os.path.join(path, "teleop", "robot_control")):
+            return path
+    return candidates[0] or os.path.expanduser("~/Fanxing/xr_teleoperate")
+
+
+_XR_ROOT = _resolve_xr_root()
+_SHARPA_SDK = os.environ.get("SHARPA_SDK_PATH", "/usr/lib/sharpa-wave-sdk/python")
+
+for p in [_REPO_ROOT, _XR_ROOT]:
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+# ── action layout ─────────────────────────────────────────────────────────────
+ARM_LEFT_SLICE  = slice(0, 7)
+ARM_RIGHT_SLICE = slice(7, 14)
+LEFT_EE_SLICE   = slice(14, 36)
+RIGHT_EE_SLICE  = slice(36, 58)
+SHARPA_DOF      = 22
+ARM_DOF         = 14
+
+import logging_mp
+logging_mp.basicConfig(level=logging_mp.INFO)
+logger = logging_mp.getLogger(__name__)
+logger.info(f"xr_teleoperate root: {_XR_ROOT}")
+if not os.path.isdir(os.path.join(_XR_ROOT, "teleop", "robot_control")):
+    logger.warning(
+        "xr_teleoperate not found; set XR_TELEOPERATE_ROOT to the checkout that contains teleop/"
+    )
+
+
+def _arm_tauff(q_target, arm_ik):
+    """Return teleop-style gravity feedforward, or zeros when compensation is off."""
+    if arm_ik is None:
+        return np.zeros(ARM_DOF, dtype=np.float64)
+    return arm_ik.compute_tauff(q_target)
+
+
+def _command_dual_arm(arm_ctrl, q_target, arm_ik=None):
+    if arm_ctrl is None:
+        return
+    q = np.asarray(q_target, dtype=np.float64).reshape(-1)
+    arm_ctrl.ctrl_dual_arm(q, _arm_tauff(q, arm_ik))
+
+
+def _make_arm_ik(enabled: bool):
+    """Load H2_ArmIK only when gravity compensation is requested."""
+    if not enabled:
+        return None
+    from teleop.robot_control.robot_arm_ik import H2_ArmIK
+    logger.info("Loading H2_ArmIK for Pinocchio RNEA gravity compensation (same as teleop)...")
+    arm_ik = H2_ArmIK(Visualization=False)
+    nq = int(arm_ik.reduced_robot.model.nq)
+    if nq != ARM_DOF:
+        raise RuntimeError(
+            f"H2_ArmIK reduced model has nq={nq}, expected {ARM_DOF} arm joints"
+        )
+    logger.info("Gravity compensation enabled (tau_ff = G(q)).")
+    return arm_ik
+
+
+# ── GR00T wire protocol (compatible with gr00t.policy.server_client) ──────────
+
+def _np_encode(obj):
+    if isinstance(obj, np.ndarray):
+        buf = io.BytesIO()
+        np.save(buf, obj, allow_pickle=False)
+        return {"__ndarray_class__": True, "as_npy": buf.getvalue()}
+    raise TypeError(f"Unknown type: {type(obj)}")
+
+
+def _np_decode(obj):
+    if not isinstance(obj, dict):
+        return obj
+    if b"__ndarray_class__" in obj or "__ndarray_class__" in obj:
+        key = b"as_npy" if b"as_npy" in obj else "as_npy"
+        return np.load(io.BytesIO(obj[key]), allow_pickle=False)
+    # Isaac-GR00T's current PolicyServer encodes arrays with msgpack-numpy.
+    # Keep accepting the legacy np.save envelope above for compatibility.
+    return msgpack_np.decode(obj)
+
+
+class GR00TClient:
+    """
+    Minimal ZMQ client compatible with gr00t.policy.server_client.PolicyServer.
+    Only requires zmq, msgpack, numpy — no gr00t package needed.
+    """
+
+    def __init__(self, host: str = "localhost", port: int = 5555, timeout_ms: int = 15000):
+        import zmq
+        self._ctx    = zmq.Context()
+        self._socket = self._ctx.socket(zmq.REQ)
+        self._socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
+        self._socket.setsockopt(zmq.SNDTIMEO, timeout_ms)
+        self._socket.connect(f"tcp://{host}:{port}")
+        self._zmq = zmq
+
+    def _send(self, endpoint: str, data: dict | None = None):
+        request = {"endpoint": endpoint}
+        if data is not None:
+            request["data"] = data
+        self._socket.send(msgpack.packb(request, default=_np_encode))
+        raw = self._socket.recv()
+        resp = msgpack.unpackb(raw, object_hook=_np_decode)
+        if isinstance(resp, dict) and "error" in resp:
+            raise RuntimeError(f"GR00T server error: {resp['error']}")
+        return resp
+
+    def _reinit_socket(self):
+        import zmq
+        self._socket.close()
+        self._socket = self._ctx.socket(zmq.REQ)
+        self._socket.setsockopt(zmq.RCVTIMEO, 15000)
+        self._socket.setsockopt(zmq.SNDTIMEO, 15000)
+
+    def ping(self) -> bool:
+        try:
+            resp = self._send("ping")
+            return isinstance(resp, dict) and resp.get("status") == "ok"
+        except Exception:
+            self._reinit_socket()
+            return False
+
+    def reset(self):
+        self._send("reset", {"options": None})
+
+    def get_action(self, obs: dict) -> tuple[dict, dict]:
+        """
+        obs: nested dict, values are np.ndarray with shape (B, T, ...) or lists of strings.
+        Returns (action_chunk, info) where action_chunk values are (B, T, D) arrays.
+        """
+        response = self._send("get_action", {"observation": obs, "options": None})
+        if isinstance(response, (list, tuple)) and len(response) == 2:
+            return response[0], response[1]
+        return response, {}
+
+    def __del__(self):
+        try:
+            self._socket.close()
+            self._ctx.term()
+        except Exception:
+            pass
+
+
+# ── Async policy worker (background inference) ───────────────────────────────
+#
+# Mirrors the isaac_ros leapp consumer protocol: the worker captures an
+# observation, queries the GR00T server, and caches (chunk, t_obs, version)
+# in a thread-safe slot. The main loop walks `action_horizon` ticks of the
+# current chunk, then at the boundary snapshots the latest cached chunk and
+# resumes execution from a *time-aligned* start_step so we skip the steps
+# of the new chunk that correspond to "the past."
+#
+# Only one thread owns the ZMQ socket. Reset between episodes is performed
+# inside the worker via `request_reset()` so the socket isn't touched from
+# the main thread.
+
+class AsyncPolicyWorker:
+    """Background producer for GR00T action chunks.
+
+    Capture cadence is whatever the server can sustain (inference is the
+    bottleneck). The main thread consumes the cache without blocking on
+    inference, achieving receding-horizon control with minimal idle time.
+    """
+
+    def __init__(self, client: GR00TClient, obs_fn, log_every: int = 30):
+        self._client = client
+        self._obs_fn = obs_fn        # () -> obs dict
+        self._stop = threading.Event()
+        self._pause = threading.Event()
+        self._pause.set()            # start paused
+        self._reset_request = threading.Event()
+        self._cache_lock = threading.Lock()
+        # (chunk_dict, t_obs_monotonic, version)
+        self._latest = None
+        self._version = 0
+        self._thread = None
+        self._infer_count = 0
+        self._log_every = log_every
+
+    def start(self):
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._loop, name="async-policy-worker", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        self._pause.clear()  # wake from pause
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+            self._thread = None
+
+    def pause(self):
+        """Stop producing new chunks (used during go_home / reset)."""
+        self._pause.set()
+
+    def resume(self):
+        """Resume producing. Drops any stale chunk from before the pause."""
+        with self._cache_lock:
+            self._latest = None
+        self._pause.clear()
+
+    def request_reset(self):
+        """Have the worker call client.reset() on its next loop iteration.
+
+        The ZMQ REQ socket is single-threaded; only the worker may touch it
+        once it's running. We signal here and wait for the worker to acknowledge.
+        """
+        self._reset_request.set()
+        # Block until the worker has cleared the flag (handled it).
+        deadline = time.monotonic() + 5.0
+        while self._reset_request.is_set():
+            if time.monotonic() > deadline or self._stop.is_set():
+                logger.warning("async worker: reset request timed out")
+                return
+            time.sleep(0.005)
+
+    def get_latest(self):
+        """Snapshot the latest cached chunk, or None if nothing cached yet.
+
+        Returns (chunk_dict, t_obs_monotonic, version) or None.
+        """
+        with self._cache_lock:
+            return self._latest
+
+    def _loop(self):
+        while not self._stop.is_set():
+            if self._pause.is_set():
+                # Even when paused, honour reset requests so they're not
+                # blocked behind the next resume().
+                if self._reset_request.is_set():
+                    try:
+                        self._client.reset()
+                    except Exception as e:
+                        logger.warning(f"async worker reset (paused) failed: {e}")
+                    self._reset_request.clear()
+                time.sleep(0.01)
+                continue
+            if self._reset_request.is_set():
+                try:
+                    self._client.reset()
+                except Exception as e:
+                    logger.warning(f"async worker reset failed: {e}")
+                self._reset_request.clear()
+                continue
+            t_obs = time.monotonic()
+            try:
+                obs = self._obs_fn()
+                chunk, _ = self._client.get_action(obs)
+            except Exception as e:
+                logger.warning(f"async inference iteration failed: {e}")
+                time.sleep(0.05)
+                continue
+            with self._cache_lock:
+                self._version += 1
+                self._latest = (chunk, t_obs, self._version)
+            self._infer_count += 1
+            if self._log_every > 0 and self._infer_count % self._log_every == 0:
+                logger.info(
+                    f"async worker: {self._infer_count} chunks cached "
+                    f"(latest version={self._version})"
+                )
+
+
+# ── Sharpa hand helpers (same as eval_h2.py) ──────────────────────────────────
+
+def _sharpa_path():
+    if _SHARPA_SDK not in sys.path:
+        sys.path.insert(0, _SHARPA_SDK)
+
+
+def connect_hand(side: str, speed_coeff: float = 0.5, current_coeff: float = 0.6):
+    _sharpa_path()
+    from sharpa import SharpaWaveManager, ControlMode, ControlSource, HandSide
+
+    hand_side = HandSide.LEFT if side == "left" else HandSide.RIGHT
+    manager   = SharpaWaveManager.get_instance()
+    time.sleep(1.0)
+
+    logger.info(f"[{side}] connecting to {hand_side.name} hand...")
+    try:
+        hand = manager.connect(hand_side)
+    except Exception as e:
+        logger.warning(f"[{side}] connect failed: {e}  — skipping")
+        return None
+
+    if hand is None:
+        logger.warning(f"[{side}] manager.connect returned None — skipping")
+        return None
+
+    err = hand.set_control_mode(ControlMode.POSITION)
+    if err.code != 0:
+        logger.error(f"[{side}] set_control_mode failed: {err.message}")
+        return None
+
+    err = hand.set_speed_coeff(speed_coeff)
+    if err.code != 0:
+        logger.warning(f"[{side}] set_speed_coeff failed: {err.message}")
+
+    err = hand.set_current_coeff(current_coeff)
+    if err.code != 0:
+        logger.warning(f"[{side}] set_current_coeff failed: {err.message}")
+
+    err = hand.set_control_source(ControlSource.SDK)
+    if err.code != 0:
+        logger.error(f"[{side}] set_control_source failed: {err.message}")
+        return None
+
+    hand.start()
+    hand.set_joint_position([0.0] * SHARPA_DOF, True)  # blocking: wait for hand to reach neutral
+    logger.info(f"[{side}] Sharpa hand ready.")
+    return hand
+
+
+def disconnect_hand(hand, side: str):
+    if hand is None:
+        return
+    _sharpa_path()
+    from sharpa import SharpaWaveManager
+    try:
+        hand.set_joint_position([0.0] * SHARPA_DOF, True)
+        time.sleep(0.5)
+        hand.stop()
+    except Exception:
+        pass
+    try:
+        SharpaWaveManager.get_instance().disconnect_all()
+    except Exception:
+        pass
+    logger.info(f"[{side}] disconnected.")
+
+
+def read_hand_state(hand) -> np.ndarray:
+    """Read 22 joint angles (radians) from either the SDK SharpaWave or the DDS client."""
+    if hand is None:
+        return np.zeros(SHARPA_DOF, dtype=np.float32)
+    try:
+        err, angles_deg = hand.get_joint_position_degree()
+        # SDK returns an Error obj with .code; DDS client returns a plain int.
+        code = getattr(err, "code", err)
+        if code != 0:
+            return np.zeros(SHARPA_DOF, dtype=np.float32)
+        return np.array([math.radians(a) for a in angles_deg[:SHARPA_DOF]], dtype=np.float32)
+    except Exception:
+        return np.zeros(SHARPA_DOF, dtype=np.float32)
+
+
+# ── Sharpa hand helpers — DDS bridge path ────────────────────────────────────
+
+def connect_hand_dds(side: str):
+    """Construct a SharpaHandDDSClient that talks to the C++ bridge on Thor."""
+    from teleop.robot_control.robot_hand_sharpa_dds import SharpaHandDDSClient
+    logger.info(f"[{side}] creating DDS client (bridge on Thor must be running)...")
+    client = SharpaHandDDSClient(side)
+    client.set_joint_position([0.0] * SHARPA_DOF, False)
+    logger.info(f"[{side}] DDS client ready.")
+    return client
+
+
+def disconnect_hand_dds(client, side: str):
+    if client is None:
+        return
+    try:
+        client.go_neutral()
+        time.sleep(0.5)
+    except Exception as e:
+        logger.warning(f"[{side}] DDS go_neutral error: {e}")
+    logger.info(f"[{side}] DDS client released.")
+
+
+# ── hand action logger (--hand-log-dir) ──────────────────────────────────────
+
+class _HandLogger:
+    """Record what the policy asks of the hands at every control tick.
+
+    Per tick: the server's absolute hand target (relative deltas already added
+    back onto the live state server-side), the value actually commanded after
+    blend/EMA, and the measured hand joints, plus the arm target/measurement.
+    Per chunk: the full predicted right-hand chunk and the right-hand state the
+    server anchored it on. One .npz + one right-hand .csv per episode."""
+
+    def __init__(self, log_dir: str, args):
+        self.dir = os.path.join(os.path.expanduser(log_dir), time.strftime("%Y%m%d_%H%M%S"))
+        os.makedirs(self.dir, exist_ok=True)
+        with open(os.path.join(self.dir, "run_meta.json"), "w") as f:
+            json.dump({k: (v if isinstance(v, (int, float, str, bool, type(None))) else str(v))
+                       for k, v in vars(args).items()}, f, indent=2)
+        self._ticks: list[dict] = []
+        self._chunks: list[dict] = []
+        logger.info(f"Hand action log -> {self.dir}")
+
+    @staticmethod
+    def _vec(x, n):
+        if x is None:
+            return np.full(n, np.nan, dtype=np.float32)
+        return np.asarray(x, dtype=np.float32).reshape(n)
+
+    def record_chunk(self, episode, chunk_idx, action_chunk, obs_state_right_hand):
+        self._chunks.append({
+            "wall_time": time.time(),
+            "episode": episode,
+            "chunk_idx": chunk_idx,
+            "right_hand_chunk": np.asarray(action_chunk["right_hand"][0], dtype=np.float32)
+                                if "right_hand" in action_chunk else np.zeros((0, SHARPA_DOF), np.float32),
+            "state_right_hand_obs": self._vec(obs_state_right_hand, SHARPA_DOF),
+        })
+
+    def record_tick(self, episode, chunk_idx, t, steps_executed,
+                    raw_rh, cmd_rh, meas_rh, raw_lh, cmd_lh, meas_lh,
+                    arm_target, arm_meas):
+        self._ticks.append({
+            "wall_time": time.time(),
+            "mono_time": time.monotonic(),
+            "episode": episode,
+            "chunk_idx": chunk_idx,
+            "t_in_chunk": t,
+            "step": steps_executed,
+            "right_hand_raw": self._vec(raw_rh, SHARPA_DOF),
+            "right_hand_cmd": self._vec(cmd_rh, SHARPA_DOF),
+            "right_hand_meas": self._vec(meas_rh, SHARPA_DOF),
+            "left_hand_raw": self._vec(raw_lh, SHARPA_DOF),
+            "left_hand_cmd": self._vec(cmd_lh, SHARPA_DOF),
+            "left_hand_meas": self._vec(meas_lh, SHARPA_DOF),
+            "arm_target": self._vec(arm_target, ARM_DOF),
+            "arm_meas": self._vec(arm_meas, ARM_DOF),
+        })
+
+    def flush(self, episode):
+        if not self._ticks and not self._chunks:
+            return
+        ticks = {k: np.stack([r[k] for r in self._ticks]) if isinstance(self._ticks[0][k], np.ndarray)
+                 else np.asarray([r[k] for r in self._ticks])
+                 for k in self._ticks[0]} if self._ticks else {}
+        rh_chunks = [c["right_hand_chunk"] for c in self._chunks]
+        if rh_chunks and len({c.shape for c in rh_chunks}) == 1:
+            rh_chunks_arr = np.stack(rh_chunks)
+        else:
+            rh_chunks_arr = np.empty(len(rh_chunks), dtype=object)
+            for i, c in enumerate(rh_chunks):
+                rh_chunks_arr[i] = c
+        chunk_arrays = {
+            "chunk_wall_time": np.asarray([c["wall_time"] for c in self._chunks]),
+            "chunk_episode": np.asarray([c["episode"] for c in self._chunks]),
+            "chunk_idx_list": np.asarray([c["chunk_idx"] for c in self._chunks]),
+            "chunk_state_right_hand_obs": np.stack([c["state_right_hand_obs"] for c in self._chunks])
+                                          if self._chunks else np.zeros((0, SHARPA_DOF), np.float32),
+            "chunk_right_hand": rh_chunks_arr,
+        }
+        path = os.path.join(self.dir, f"ep{episode:02d}_hand_log.npz")
+        np.savez_compressed(path, **ticks, **chunk_arrays)
+
+        if self._ticks:
+            csv_path = os.path.join(self.dir, f"ep{episode:02d}_right_hand.csv")
+            cols = (["wall_time", "episode", "chunk_idx", "t_in_chunk", "step"]
+                    + [f"raw_{i}" for i in range(SHARPA_DOF)]
+                    + [f"cmd_{i}" for i in range(SHARPA_DOF)]
+                    + [f"meas_{i}" for i in range(SHARPA_DOF)])
+            with open(csv_path, "w") as f:
+                f.write(",".join(cols) + "\n")
+                for r in self._ticks:
+                    vals = [f"{r['wall_time']:.6f}", r["episode"], r["chunk_idx"], r["t_in_chunk"], r["step"]]
+                    vals += [f"{v:.6f}" for v in np.concatenate(
+                        [r["right_hand_raw"], r["right_hand_cmd"], r["right_hand_meas"]])]
+                    f.write(",".join(map(str, vals)) + "\n")
+        logger.info(f"Hand log: episode {episode} -> {path} "
+                    f"({len(self._ticks)} ticks, {len(self._chunks)} chunks)")
+        self._ticks.clear()
+        self._chunks.clear()
+
+
+# ── right-hand execution offset (--right-hand-offset-json) ───────────────────
+
+# Sharpa 22-joint order: thumb 0-4, index 5-8, middle 9-12, ring 13-16, pinky 17-21.
+FINGER_SLICES = {
+    "thumb":  slice(0, 5),
+    "index":  slice(5, 9),
+    "middle": slice(9, 13),
+    "ring":   slice(13, 17),
+    "pinky":  slice(17, 22),
+}
+
+
+# Flexion joints (positive = more closed): everything except the abduction (AA)
+# joints and pinky_CMC.
+_HAND_AA_IDX = (1, 3, 6, 10, 14, 17, 19)
+
+
+def _load_right_hand_offset(path: str, fingers: list[str], scale: float,
+                            mode: str = "all") -> np.ndarray:
+    """Per-joint offset added to the absolute right-hand target from the server.
+
+    Reads offset_needed_tele_minus_model (analyze_right_hand_log.py output) and
+    keeps only the requested fingers; the state fed to the model is untouched.
+    mode="flex-only" keeps just the components that close the hand further
+    (positive values on flexion joints), so knuckles are never opened."""
+    with open(os.path.expanduser(path), "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    for key in ("offset_needed_tele_minus_model", "offset_grasp_tele_minus_ego"):
+        if key in payload:
+            vec = np.asarray(payload[key], dtype=np.float64)
+            break
+    else:
+        raise ValueError(f"{path}: no offset_needed_tele_minus_model key")
+    if vec.size != SHARPA_DOF:
+        raise ValueError(f"{path}: offset has {vec.size} values, expected {SHARPA_DOF}")
+    mask = np.zeros(SHARPA_DOF, dtype=np.float64)
+    for name in fingers:
+        mask[FINGER_SLICES[name]] = 1.0
+    if mode == "flex-only":
+        mask[list(_HAND_AA_IDX)] = 0.0
+        mask[vec < 0.0] = 0.0
+    offset = vec * mask * scale
+    names = payload.get("joint_names_right_hand_dims_36_to_57", [f"j{i}" for i in range(SHARPA_DOF)])
+    applied = ", ".join(f"{names[i]}={offset[i]:+.3f}" for i in range(SHARPA_DOF) if offset[i] != 0.0)
+    logger.info(f"Right-hand execution offset ({key} x {scale:g}, fingers={fingers}, mode={mode}) "
+                f"from {path}:\n  {applied}")
+    return offset
+
+
+# ── home / countdown helpers (mirrors replay_episode.py) ─────────────────────
+
+def _countdown(seconds: int, label: str):
+    for i in range(seconds, 0, -1):
+        print(f"  {label}: {i}s ", end="\r", flush=True)
+        time.sleep(1.0)
+    print(f"  {label}: done.          ")
+
+
+def _go_home(arm_ctrl, left_hand, right_hand, hold_s: int, arm_ik=None):
+    """Move arm to home, hands to neutral, then hold for hold_s seconds."""
+    logger.info(f"Going to home position (hold {hold_s}s)...")
+    if arm_ctrl is not None:
+        q_home = np.zeros(ARM_DOF, dtype=np.float64)
+        _command_dual_arm(arm_ctrl, q_home, arm_ik)
+        arm_ctrl.ctrl_dual_arm_go_home()
+    for side, hand in [("left", left_hand), ("right", right_hand)]:
+        if hand is not None:
+            hand.set_joint_position([0.0] * SHARPA_DOF, True)
+    _countdown(hold_s, "holding home")
+
+
+def _load_init_state_yaml(yaml_path):
+    """Load an average-initial-state YAML produced by
+    teleop/utils/compute_average_initial_state.py. Returns the nested dict
+    under "states" (left_arm.qpos, right_arm.qpos, left_ee.qpos, right_ee.qpos)."""
+    import yaml
+    with open(yaml_path, "r", encoding="utf-8") as f:
+        payload = yaml.safe_load(f)
+    if not isinstance(payload, dict) or "states" not in payload:
+        raise ValueError(
+            f"{yaml_path} does not contain a top-level 'states' dict. "
+            "Was this file generated by compute_average_initial_state.py?"
+        )
+    logger.info(
+        f"Loaded init state from {yaml_path} "
+        f"(first_n_frames={payload.get('first_n_frames')}, "
+        f"num_episodes={payload.get('num_episodes')}, "
+        f"num_frames={payload.get('num_frames')})."
+    )
+    return payload["states"]
+
+
+def _go_to_init_state(arm_ctrl, left_hand, right_hand, init_state: dict, hold_s: int,
+                      arm_ik=None):
+    """Move arm + hands to the recorded average initial posture and hold.
+
+    init_state is the dict loaded from the YAML's "states" key, e.g.
+        {"left_arm": {"qpos": [...7]}, "right_arm": {"qpos": [...7]},
+         "left_ee":  {"qpos": [...22]}, "right_ee": {"qpos": [...22]}}
+    Body waist is read-only on H2 and is ignored even if present.
+    """
+    if not init_state:
+        return
+
+    if arm_ctrl is not None:
+        left_arm_q  = np.asarray(
+            init_state.get("left_arm", {}).get("qpos", [0.0] * 7), dtype=np.float64
+        )
+        right_arm_q = np.asarray(
+            init_state.get("right_arm", {}).get("qpos", [0.0] * 7), dtype=np.float64
+        )
+        if left_arm_q.size != 7 or right_arm_q.size != 7:
+            raise ValueError(
+                f"Init state arm dims wrong (got left={left_arm_q.size}, right={right_arm_q.size}); "
+                f"expected 7 each."
+            )
+        arm_q_target = np.concatenate([left_arm_q, right_arm_q])
+        logger.info(
+            f"Going to init posture (hold {hold_s}s). "
+            f"Arm rate-limit will smooth the move from current pose."
+        )
+        _command_dual_arm(arm_ctrl, arm_q_target, arm_ik)
+
+    if left_hand is not None:
+        left_ee_q = init_state.get("left_ee", {}).get("qpos")
+        if left_ee_q and len(left_ee_q) == SHARPA_DOF:
+            left_hand.set_joint_position(list(map(float, left_ee_q)), True)
+    if right_hand is not None:
+        right_ee_q = init_state.get("right_ee", {}).get("qpos")
+        if right_ee_q and len(right_ee_q) == SHARPA_DOF:
+            right_hand.set_joint_position(list(map(float, right_ee_q)), True)
+
+    _countdown(hold_s, "holding init posture")
+
+
+# ── camera client factory ────────────────────────────────────────────────────
+
+def _make_image_client(args):
+    """Build a camera client and return (client, cam_config)."""
+    if args.image_source == "dds":
+        from teleop.utils.dds_image_client import DDSImageClient
+        client = DDSImageClient(
+            domain_id=args.camera_dds_domain,
+            network_interface=args.camera_network_interface,
+            warmup_timeout=args.cam_warmup_s,
+        )
+        cam_config = client.get_cam_config()
+        logger.info(f"Camera client: native CycloneDDS domain {args.camera_dds_domain}")
+    elif args.image_source == "ros":
+        from teleop.utils.ros_image_client import ROSImageClient
+        client = ROSImageClient(warmup_timeout=args.cam_warmup_s)
+        cam_config = client.get_cam_config()
+        logger.info("Camera client: ROS 2 (CycloneDDS)")
+    else:
+        from teleimager.image_client import ImageClient
+        client = ImageClient(host=args.img_server_ip, request_bgr=True)
+        cam_config = client.get_cam_config()
+        logger.info(f"Camera client: ZMQ teleimager at {args.img_server_ip}")
+    return client, cam_config
+
+
+def _warm_cameras(img_client, timeout_s: float = 5.0, head_eye: str = "left"):
+    """Poll the three policy cameras until each returns a non-None bgr or timeout."""
+    use_left = _physical_head_side(head_eye) == "left"
+    if use_left and hasattr(img_client, "get_left_head_frame"):
+        head_getter = ("head_left", img_client.get_left_head_frame)
+    elif not use_left and hasattr(img_client, "get_right_head_frame"):
+        head_getter = ("head_right", img_client.get_right_head_frame)
+    else:
+        head_getter = ("head", img_client.get_head_frame)
+    getters = [
+        head_getter,
+        ("wrist_left",  img_client.get_left_wrist_frame),
+        ("wrist_right", img_client.get_right_wrist_frame),
+    ]
+    deadline = time.perf_counter() + timeout_s
+    warmed = set()
+    while len(warmed) < len(getters) and time.perf_counter() < deadline:
+        for name, getter in getters:
+            if name in warmed:
+                continue
+            f = getter()
+            if f is not None and getattr(f, "bgr", None) is not None:
+                warmed.add(name)
+        if len(warmed) < len(getters):
+            time.sleep(0.05)
+    logger.info(f"Cameras warmed: {sorted(warmed)} ({len(warmed)}/{len(getters)})")
+
+
+# ── hand setup / teardown ────────────────────────────────────────────────────
+
+def _setup_hands(args):
+    """Connect both hands via the chosen source. Returns (left, right)."""
+    if not args.hands:
+        return None, None
+
+    if args.hands_source == "dds":
+        logger.info("Connecting hands via DDS bridge...")
+        left  = connect_hand_dds("left")
+        right = connect_hand_dds("right")
+    else:
+        logger.info("Connecting hands via direct Sharpa SDK...")
+        left  = connect_hand("left",  args.hand_speed_coeff, args.hand_current_coeff)
+        right = connect_hand("right", args.hand_speed_coeff, args.hand_current_coeff)
+    logger.info("Waiting for hands to reach neutral...")
+    time.sleep(2.0)
+    return left, right
+
+
+def _teardown_hands(args, left_hand, right_hand):
+    if not args.hands:
+        return
+    if args.hands_source == "dds":
+        disconnect_hand_dds(left_hand,  "left")
+        disconnect_hand_dds(right_hand, "right")
+    else:
+        disconnect_hand(left_hand,  "left")
+        disconnect_hand(right_hand, "right")
+
+
+# ── observation helpers ───────────────────────────────────────────────────────
+
+def _add_bt_dims(obs: dict) -> dict:
+    """
+    Add (B=1, T=1) leading dims to every numpy array in the nested obs dict.
+    Strings become [[str]] (two levels of list wrapping).
+    """
+    out = {}
+    for k, v in obs.items():
+        if isinstance(v, np.ndarray):
+            out[k] = v[np.newaxis, np.newaxis, ...]   # (H,W,3) → (1,1,H,W,3)
+        elif isinstance(v, dict):
+            out[k] = _add_bt_dims(v)
+        else:
+            out[k] = [[v]]   # str → [[str]]
+    return out
+
+
+def _split_head_image(stitched: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """ROSImageClient.get_head_frame() returns a (H, 2W, 3) horizontally-stitched
+    stereo image. Split it back into (left_eye, right_eye)."""
+    if stitched is None:
+        return None, None
+    w = stitched.shape[1] // 2
+    return stitched[:, :w, :], stitched[:, w:, :]
+
+
+def _frame_to_rgb(frame) -> np.ndarray | None:
+    if frame is None or getattr(frame, "bgr", None) is None:
+        return None
+    return frame.bgr[:, :, ::-1].copy()
+
+
+def _physical_head_side(head_eye: str) -> str:
+    """Return the physical head camera side used for video.head_right."""
+    if head_eye == "left":
+        return "left"
+    return "right"  # head_eye in ("right", "both")
+
+
+def _head_source_label(head_eye: str, image_source: str) -> str:
+    side = _physical_head_side(head_eye)
+    if image_source == "dds":
+        return f"video.head_right ← DDS h2/camera/head_{side}/compressed (physical {side} eye)"
+    if image_source == "ros":
+        return f"video.head_right ← ROS head_{side} topic (physical {side} eye)"
+    return f"video.head_right ← ZMQ head_camera (physical {side} eye if stereo split applies)"
+
+
+def _head_right_rgb(img_client, head_eye: str) -> np.ndarray | None:
+    """RGB frame for the policy key ``video.head_right``.
+
+    The key name comes from the trained modality schema; ``--head-eye`` selects
+    which physical head camera fills it. Default ``left`` matches datasets such as
+    trocar_ego that store the left-eye view under ``observation.images.head_right``.
+    """
+    use_left = _physical_head_side(head_eye) == "left"
+    if use_left and hasattr(img_client, "get_left_head_frame"):
+        rgb = _frame_to_rgb(img_client.get_left_head_frame())
+        if rgb is not None:
+            return rgb
+    if not use_left and hasattr(img_client, "get_right_head_frame"):
+        rgb = _frame_to_rgb(img_client.get_right_head_frame())
+        if rgb is not None:
+            return rgb
+
+    head_frame = img_client.get_head_frame()
+    if head_frame is None or head_frame.bgr is None:
+        return None
+    left_eye, right_eye = _split_head_image(head_frame.bgr)
+    chosen = left_eye if use_left else right_eye
+    if chosen is None:
+        return None
+    return chosen[:, :, ::-1].copy()
+
+
+# Canonical camera names used inside this script -> policy video modality keys.
+# The checkpoint's processor_config.json (modality_configs.<embodiment>.video.
+# modality_keys) decides the names the server expects; e.g. tele_0831 runs use
+# head_right/wrist_left/wrist_right, trocar_cotrain_gr00t runs use
+# high/left_wrist_view/right_wrist_view. Override with --video-key-*.
+def _video_key_map(args) -> dict[str, str]:
+    return {
+        "head_right":  args.video_key_head,
+        "wrist_left":  args.video_key_wrist_left,
+        "wrist_right": args.video_key_wrist_right,
+    }
+
+
+def get_observations(img_client, arm_ctrl, left_hand, right_hand,
+                     cam_config, task: str, head_eye: str = "left",
+                     image_source: str = "ros",
+                     swap_wrist_cams: bool = False,
+                     video_key_map: dict[str, str] | None = None) -> dict:
+    """Build the nested GR00T observation dict (before adding batch/time dims).
+
+    ``video_key_map`` renames the canonical camera names (head_right,
+    wrist_left, wrist_right) to the checkpoint's video modality keys.
+    """
+    video: dict[str, np.ndarray] = {}
+
+    if image_source in ("dds", "ros"):
+        l_wrist = img_client.get_left_wrist_frame()
+        r_wrist = img_client.get_right_wrist_frame()
+        # Optional: physical wiring sometimes swaps the wrist cameras. This flag
+        # corrects it at the observation layer without re-wiring or re-recording.
+        if swap_wrist_cams:
+            l_wrist, r_wrist = r_wrist, l_wrist
+
+        head_rgb = _head_right_rgb(img_client, head_eye)
+        if head_rgb is not None:
+            video["head_right"] = head_rgb
+        l_rgb = _frame_to_rgb(l_wrist)
+        if l_rgb is not None:
+            video["wrist_left"] = l_rgb
+        r_rgb = _frame_to_rgb(r_wrist)
+        if r_rgb is not None:
+            video["wrist_right"] = r_rgb
+    else:  # legacy ZMQ teleimager
+        cam_name_to_key = {
+            "head_camera":        "head_right",
+            "left_wrist_camera":  "wrist_left",
+            "right_wrist_camera": "wrist_right",
+        }
+        # Swap which physical wrist feeds which key when requested.
+        if swap_wrist_cams:
+            getter_map = {
+                "head_right":   img_client.get_head_frame,
+                "wrist_left":   img_client.get_right_wrist_frame,
+                "wrist_right":  img_client.get_left_wrist_frame,
+            }
+        else:
+            getter_map = {
+                "head_right":   img_client.get_head_frame,
+                "wrist_left":   img_client.get_left_wrist_frame,
+                "wrist_right":  img_client.get_right_wrist_frame,
+            }
+        for cam_name, cfg in cam_config.items():
+            if not cfg.get("enable_zmq"):
+                continue
+            key    = cam_name_to_key.get(cam_name)
+            getter = getter_map.get(key) if key else None
+            if getter is None:
+                continue
+            rgb = _frame_to_rgb(getter())
+            if rgb is not None:
+                video[key] = rgb
+
+    if video_key_map:
+        video = {video_key_map.get(k, k): v for k, v in video.items()}
+
+    arm_q = arm_ctrl.get_current_dual_arm_q().astype(np.float32)
+    state = {
+        "left_arm":  arm_q[ARM_LEFT_SLICE],
+        "right_arm": arm_q[ARM_RIGHT_SLICE],
+        "left_hand":  read_hand_state(left_hand),
+        "right_hand": read_hand_state(right_hand),
+    }
+
+    obs = {
+        "video":    video,
+        "state":    state,
+        "language": {"annotation.human.task_description": task},
+    }
+    return _add_bt_dims(obs)
+
+
+# ── check mode ────────────────────────────────────────────────────────────────
+
+def check_observations(args):
+    """
+    Build one full observation dict (exactly as sent to the GR00T server) and
+    print every field's key path, shape, dtype, and value range.
+    Camera snapshots are saved to /tmp/check_<key>.png for visual inspection.
+    """
+    import cv2
+
+    # DDS factory: needed for arm and for DDS-bridge hand client.
+    need_dds = args.arm or (args.hands and args.hands_source == "dds") \
+        or args.image_source in ("dds", "ros")
+    if args.arm or (args.hands and args.hands_source == "dds"):
+        from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+        ChannelFactoryInitialize(args.dds_domain, args.network_interface)
+        logger.info(f"DDS ChannelFactory initialised on domain {args.dds_domain} "
+                    f"(interface={args.network_interface or 'auto'}).")
+
+    left_hand, right_hand = _setup_hands(args)
+
+    arm_ctrl = None
+    if args.arm:
+        from teleop.robot_control.robot_arm import H2_ArmController
+        logger.info(
+            f"Initialising H2_ArmController (motion_mode={args.motion}, "
+            f"head_pitch_home={args.head_pitch_home})..."
+        )
+        arm_ctrl = H2_ArmController(
+            motion_mode=args.motion,
+            head_pitch_home=args.head_pitch_home,
+            kp_low=args.kp_low, kp_wrist=args.kp_wrist,
+            kd_low=args.kd_low, kd_wrist=args.kd_wrist,
+        )
+        logger.info("H2_ArmController ready.")
+
+    img_client, cam_config = _make_image_client(args)
+    logger.info(f"Camera config keys: {list(cam_config.keys())}")
+    logger.info(_head_source_label(args.head_eye, args.image_source))
+    _warm_cameras(img_client, timeout_s=args.cam_warmup_s, head_eye=args.head_eye)
+
+    obs = get_observations(img_client, arm_ctrl, left_hand, right_hand,
+                           cam_config, args.task,
+                           head_eye=args.head_eye,
+                           image_source=args.image_source,
+                           swap_wrist_cams=args.swap_wrist_cams,
+                                           video_key_map=_video_key_map(args))
+
+    def _print_nested(d: dict, prefix: str = ""):
+        for k, v in d.items():
+            path = f"{prefix}.{k}" if prefix else k
+            if isinstance(v, dict):
+                _print_nested(v, path)
+            elif isinstance(v, np.ndarray):
+                logger.info(
+                    f"  {path:45s}  shape={str(v.shape):20s}  dtype={v.dtype}"
+                    f"  min={v.min():.4f}  max={v.max():.4f}  mean={v.mean():.4f}"
+                )
+            else:
+                logger.info(f"  {path:45s}  value={v!r}")
+
+    logger.info("\n=== Observation fields (after batch/time dims added) ===")
+    _print_nested(obs)
+
+    if not obs.get("video"):
+        logger.error("video dict is EMPTY — no camera frames received.")
+
+    logger.info("\n=== Camera snapshots ===")
+    if hasattr(img_client, "get_left_head_frame") and hasattr(img_client, "get_right_head_frame"):
+        for side, getter in (
+            ("head_left_physical", img_client.get_left_head_frame),
+            ("head_right_physical", img_client.get_right_head_frame),
+        ):
+            rgb = _frame_to_rgb(getter())
+            if rgb is not None:
+                save_path = f"/tmp/check_{side}.png"
+                cv2.imwrite(save_path, rgb[:, :, ::-1])
+                logger.info(f"  [{side}] saved → {save_path}")
+
+    logger.info(f"  policy mapping: {_head_source_label(args.head_eye, args.image_source)}")
+    for key, arr in obs.get("video", {}).items():
+        img_rgb = arr[0, 0]   # (1, 1, H, W, 3) → (H, W, 3) RGB
+        img_bgr = img_rgb[:, :, ::-1].copy()
+        save_path = f"/tmp/check_{key}.png"
+        cv2.imwrite(save_path, img_bgr)
+        logger.info(f"  [{key}] saved → {save_path}")
+
+    logger.info("\nCheck complete.")
+    _teardown_hands(args, left_hand, right_hand)
+    try:
+        img_client.close()
+    except Exception:
+        pass
+
+
+# ── main eval loop ─────────────────────────────────────────────────────────────
+
+def eval_h2_groot(args):
+    if args.check:
+        check_observations(args)
+        return
+
+    # DDS factory must be ready before any DDS publisher/subscriber is created
+    # (H2_ArmController and SharpaHandDDSClient both need this).
+    if args.arm or (args.hands and args.hands_source == "dds"):
+        from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+        ChannelFactoryInitialize(args.dds_domain, args.network_interface)
+        logger.info(f"DDS ChannelFactory initialised on domain {args.dds_domain} "
+                    f"(interface={args.network_interface or 'auto'}).")
+
+    left_hand, right_hand = _setup_hands(args)
+
+    # Build the gravity model BEFORE the arm controller exists: H2_ArmController
+    # starts publishing at 250 Hz from inside its constructor with tau_ff = 0, and
+    # the pinocchio/casadi import + model build takes ~0.3 s, during which the arms
+    # sag under gravity and then jump back up once the first real tau_ff arrives.
+    arm_ik = _make_arm_ik(bool(args.arm and args.gravity_comp))
+    if args.arm and not args.gravity_comp:
+        logger.info("Gravity compensation disabled (tau_ff = 0). Pass --gravity-comp to enable.")
+
+    arm_ctrl = None
+    if args.arm:
+        from teleop.robot_control.robot_arm import H2_ArmController
+        logger.info(
+            f"Initialising H2_ArmController (motion_mode={args.motion}, "
+            f"head_pitch_home={args.head_pitch_home})..."
+        )
+        arm_ctrl = H2_ArmController(
+            motion_mode=args.motion,
+            head_pitch_home=args.head_pitch_home,
+            kp_low=args.kp_low, kp_wrist=args.kp_wrist,
+            kd_low=args.kd_low, kd_wrist=args.kd_wrist,
+        )
+        # The controller's own defaults are q_target = 0 and tau_ff = 0; hold the
+        # measured pose with gravity feedforward until _go_home commands the move.
+        _command_dual_arm(arm_ctrl, arm_ctrl.get_current_dual_arm_q(), arm_ik)
+        arm_ctrl.speed_gradual_max()
+        logger.info("H2_ArmController ready.")
+
+    # Optional: load the average initial state YAML so the robot starts each
+    # episode from the same posture distribution the policy saw during training.
+    init_state = None
+    if args.init_state_yaml:
+        init_state = _load_init_state_yaml(args.init_state_yaml)
+
+    hand_log = _HandLogger(args.hand_log_dir, args) if args.hand_log_dir else None
+    right_hand_offset = None
+    if args.right_hand_offset_json:
+        right_hand_offset = _load_right_hand_offset(
+            args.right_hand_offset_json,
+            [f.strip() for f in args.right_hand_offset_fingers.split(",") if f.strip()],
+            args.right_hand_offset_scale,
+            mode=args.right_hand_offset_mode,
+        )
+
+    _go_home(arm_ctrl, left_hand, right_hand, hold_s=args.hold_s, arm_ik=arm_ik)
+    if init_state is not None:
+        _go_to_init_state(arm_ctrl, left_hand, right_hand, init_state,
+                          hold_s=args.init_state_hold_s, arm_ik=arm_ik)
+
+    img_client, cam_config = _make_image_client(args)
+    logger.info(f"Camera config: {list(cam_config.keys())}")
+    logger.info(_head_source_label(args.head_eye, args.image_source))
+    _warm_cameras(img_client, timeout_s=args.cam_warmup_s, head_eye=args.head_eye)
+
+    # ── GR00T policy client ───────────────────────────────────────────────────
+    logger.info(f"Connecting to GR00T server at {args.policy_host}:{args.policy_port} ...")
+    client = GR00TClient(host=args.policy_host, port=args.policy_port,
+                         timeout_ms=args.timeout_ms)
+    for attempt in range(30):
+        if client.ping():
+            logger.info("GR00T server: connected.")
+            break
+        logger.info(f"  waiting for server... ({attempt+1}/30)")
+        time.sleep(2.0)
+    else:
+        raise RuntimeError("Could not reach GR00T server after 60s. Is it running?")
+
+    # ── prompt user ───────────────────────────────────────────────────────────
+    user_input = input("\nPress [Enter] to start inference (or 'q' to quit): ")
+    if user_input.lower() == "q":
+        return
+
+    logger.info(f"Inference config: {args.frequency} Hz, "
+                f"action_horizon={args.action_horizon}, steps_per_episode={args.steps}, "
+                f"task='{args.task}', async_policy={args.async_policy}, "
+                f"gravity_comp={args.gravity_comp}, "
+                f"video_keys={_video_key_map(args)}")
+    logger.info("Running: home(20s) → inference → home(20s) → inference → ...  Ctrl+C to stop.")
+
+    dt       = 1.0 / args.frequency
+    step_dt  = dt  # the chunk's per-step time spacing matches the consumer rate
+    episode  = 0
+
+    # ── optional async worker setup ───────────────────────────────────────────
+    worker = None
+    if args.async_policy:
+        def _obs_capture_fn():
+            return get_observations(img_client, arm_ctrl, left_hand, right_hand,
+                                    cam_config, args.task,
+                                    head_eye=args.head_eye,
+                                    image_source=args.image_source,
+                                    swap_wrist_cams=args.swap_wrist_cams,
+                                           video_key_map=_video_key_map(args))
+        worker = AsyncPolicyWorker(client, _obs_capture_fn)
+        worker.start()
+        logger.info("Async policy worker started (paused).")
+
+    try:
+        while True:
+            episode += 1
+            if worker is not None:
+                # Pause worker, reset policy via worker (sole socket owner),
+                # then resume so chunks start flowing again for this episode.
+                worker.pause()
+                worker.request_reset()
+                worker.resume()
+            else:
+                client.reset()
+            logger.info(f"\n=== Episode {episode} ===")
+
+            # EMA state on the per-step action targets. Smooths high-frequency
+            # noise from the policy output (visible as arm/hand jitter).
+            # alpha == 1.0 -> raw action, no smoothing (backwards compatible).
+            # smaller alpha -> heavier smoothing + slightly more lag.
+            smooth_alpha = float(args.smooth_alpha)
+            boundary_alpha = float(args.boundary_smooth_alpha)
+            boundary_total = max(0, int(args.boundary_smooth_steps))
+            blend_total = max(0, int(args.boundary_blend_steps))
+            # alpha > 0 → exp(-alpha * t/N) decays. alpha <= 0 would give
+            # w_old >= 1 forever — clamp to a tiny positive.
+            blend_alpha = max(1e-6, float(args.boundary_blend_alpha))
+            prev_left_arm = None
+            prev_right_arm = None
+            prev_left_hand = None
+            prev_right_hand = None
+            last_loaded_version = -1
+            # Counter — how many remaining boundary-smoothing ticks for the
+            # current chunk. Reset to boundary_total on every chunk switch.
+            boundary_remaining = 0
+            # Cross-chunk crossfade state: the just-finished chunk and the
+            # step index where it would have continued. Used to blend the
+            # old chunk's unexecuted future steps with the new chunk's first
+            # few steps (same wall-clock-time pairs).
+            prev_chunk = None
+            prev_chunk_next_t = 0
+            chunk_idx = 0
+            obs = None
+
+            steps_executed = 0
+            while steps_executed < args.steps:
+                # ── fetch next chunk ─────────────────────────────────────────
+                if worker is not None:
+                    # Wait for the worker to produce a chunk we haven't seen.
+                    # While waiting we hold the previous target via the arm
+                    # controller's internal latch (no new ctrl_dual_arm calls).
+                    wait_started = time.monotonic()
+                    while True:
+                        latest = worker.get_latest()
+                        if latest is not None and latest[2] > last_loaded_version:
+                            break
+                        if time.monotonic() - wait_started > 30.0:
+                            raise RuntimeError("Async worker produced no chunk in 30s.")
+                        time.sleep(args.async_cache_poll_s)
+                    action_chunk, t_obs, version = latest
+                    last_loaded_version = version
+
+                    chunk_len = (action_chunk["left_arm"].shape[1]
+                                 if "left_arm" in action_chunk else args.action_horizon)
+
+                    # Time-aligned start_step: skip the steps of the new chunk
+                    # whose intended execution time has already elapsed during
+                    # observation + inference latency.
+                    age = max(0.0, time.monotonic() - t_obs)
+                    start_step = int(age / step_dt)
+                    if start_step < 0:
+                        start_step = 0
+                    if start_step >= chunk_len:
+                        start_step = chunk_len - 1
+                else:
+                    # Sync mode — current behavior, observation + inference
+                    # blocks the loop here.
+                    obs = get_observations(img_client, arm_ctrl, left_hand, right_hand,
+                                           cam_config, args.task,
+                                           head_eye=args.head_eye,
+                                           image_source=args.image_source,
+                                           swap_wrist_cams=args.swap_wrist_cams,
+                                           video_key_map=_video_key_map(args))
+                    action_chunk, _ = client.get_action(obs)
+                    chunk_len = (action_chunk["left_arm"].shape[1]
+                                 if "left_arm" in action_chunk else args.action_horizon)
+                    start_step = 0
+
+                chunk_idx += 1
+                if hand_log is not None:
+                    obs_rh = (obs["state"]["right_hand"][0, 0]
+                              if (worker is None and obs is not None) else None)
+                    hand_log.record_chunk(episode, chunk_idx, action_chunk, obs_rh)
+
+                horizon = min(args.action_horizon,
+                              chunk_len - start_step,
+                              args.steps - steps_executed)
+                if horizon <= 0:
+                    # The latest cached chunk is so old that start_step is
+                    # already at the end. Drop it and try again next iter.
+                    logger.warning(
+                        f"chunk skipped: start_step={start_step} chunk_len={chunk_len}"
+                    )
+                    continue
+
+                # New chunk just loaded → restart boundary-smoothing window.
+                # (Only meaningful if prev_* is set; the very first chunk has
+                # no anchor so EMA passes through raw values regardless.)
+                boundary_remaining = boundary_total
+
+                # Cross-chunk blend window: number of leading steps where we
+                # mix prev_chunk[prev_next_t + i] with action_chunk[start+i].
+                # Bounded by:
+                #   * blend_total (user-requested),
+                #   * prev chunk's unused future (chunk_A_len - prev_next_t),
+                #   * new chunk's available horizon.
+                if (blend_total > 0 and prev_chunk is not None
+                        and "left_arm" in prev_chunk):
+                    prev_chunk_len = prev_chunk["left_arm"].shape[1]
+                    old_remaining = max(0, prev_chunk_len - prev_chunk_next_t)
+                    blend_window = min(blend_total, old_remaining, horizon)
+                else:
+                    blend_window = 0
+
+                if blend_window > 0:
+                    # w_old at step 0 = 1.0 always; w_old at step N = exp(-alpha).
+                    # We report the value at the LAST included step (N-1).
+                    w_old_final = math.exp(-blend_alpha * (blend_window - 1) / blend_window)
+                    logger.info(
+                        f"boundary blend: {blend_window} steps "
+                        f"(old @ {prev_chunk_next_t}..{prev_chunk_next_t + blend_window - 1} "
+                        f"× new @ {start_step}..{start_step + blend_window - 1}, "
+                        f"alpha={blend_alpha:.2f}, "
+                        f"w_old: 1.000→{w_old_final:.3f})"
+                    )
+
+                # ── walk the chunk for `horizon` ticks (action_horizon or less) ──
+                for offset in range(horizon):
+                    t = start_step + offset
+                    t0 = time.perf_counter()
+                    raw_lh = lh = raw_rh = rh = None
+
+                    # Effective alpha for this tick — heavier blend right after
+                    # a chunk switch to hide the discontinuity between two
+                    # independently-sampled chunks; ramps back to user's
+                    # smooth_alpha once boundary_remaining hits 0.
+                    if boundary_remaining > 0:
+                        effective_alpha = boundary_alpha
+                        boundary_remaining -= 1
+                    else:
+                        effective_alpha = smooth_alpha
+
+                    # Build raw targets — either pure new chunk, or a linear
+                    # blend with the old chunk at the same wall-clock-time index.
+                    if offset < blend_window:
+                        old_t = prev_chunk_next_t + offset
+                        # w_new ramps from 1/N to N/N over the blend window:
+                        # old wins early, new wins late, clean handoff at the
+                        # end of the window (w_new == 1.0 for offset == N-1).
+                        # Exponential blend: w_old = exp(-alpha * t/N) where
+                        # t = offset, N = blend_window. Step 0 starts with
+                        # w_old=1.0 (pure old chunk) and decays toward
+                        # exp(-alpha) at step N.
+                        w_old = math.exp(-blend_alpha * offset / blend_window)
+                        w_new = 1.0 - w_old
+                        raw_left_arm  = (w_new * action_chunk["left_arm"][0][t].astype(np.float64)
+                                         + w_old * prev_chunk["left_arm"][0][old_t].astype(np.float64))
+                        raw_right_arm = (w_new * action_chunk["right_arm"][0][t].astype(np.float64)
+                                         + w_old * prev_chunk["right_arm"][0][old_t].astype(np.float64))
+                    else:
+                        raw_left_arm  = action_chunk["left_arm"][0][t].astype(np.float64)
+                        raw_right_arm = action_chunk["right_arm"][0][t].astype(np.float64)
+
+                    if effective_alpha < 1.0:
+                        if prev_left_arm is None:
+                            left_arm = raw_left_arm
+                            right_arm = raw_right_arm
+                        else:
+                            left_arm  = effective_alpha * raw_left_arm  + (1.0 - effective_alpha) * prev_left_arm
+                            right_arm = effective_alpha * raw_right_arm + (1.0 - effective_alpha) * prev_right_arm
+                    else:
+                        left_arm = raw_left_arm
+                        right_arm = raw_right_arm
+                    prev_left_arm = left_arm
+                    prev_right_arm = right_arm
+
+                    arm_q_target = np.concatenate([left_arm, right_arm])
+                    _command_dual_arm(arm_ctrl, arm_q_target, arm_ik)
+
+                    if args.hands:
+                        if left_hand is not None and "left_hand" in action_chunk:
+                            if offset < blend_window and "left_hand" in (prev_chunk or {}):
+                                old_t = prev_chunk_next_t + offset
+                                w_new = (offset + 1) / float(blend_window)
+                                w_old = 1.0 - w_new
+                                raw_lh = (w_new * np.asarray(action_chunk["left_hand"][0][t], dtype=np.float64)
+                                          + w_old * np.asarray(prev_chunk["left_hand"][0][old_t], dtype=np.float64))
+                            else:
+                                raw_lh = np.asarray(action_chunk["left_hand"][0][t], dtype=np.float64)
+                            if effective_alpha < 1.0 and prev_left_hand is not None:
+                                lh = effective_alpha * raw_lh + (1.0 - effective_alpha) * prev_left_hand
+                            else:
+                                lh = raw_lh
+                            prev_left_hand = lh
+                            err = left_hand.set_joint_position(lh.tolist(), False)
+                            # DDS client returns None; SDK returns Error obj.
+                            if err is not None and getattr(err, "code", 0) != 0:
+                                logger.warning(f"left hand error t={t}: {err.message}")
+                        if right_hand is not None and "right_hand" in action_chunk:
+                            if offset < blend_window and "right_hand" in (prev_chunk or {}):
+                                old_t = prev_chunk_next_t + offset
+                                w_new = (offset + 1) / float(blend_window)
+                                w_old = 1.0 - w_new
+                                raw_rh = (w_new * np.asarray(action_chunk["right_hand"][0][t], dtype=np.float64)
+                                          + w_old * np.asarray(prev_chunk["right_hand"][0][old_t], dtype=np.float64))
+                            else:
+                                raw_rh = np.asarray(action_chunk["right_hand"][0][t], dtype=np.float64)
+                            if effective_alpha < 1.0 and prev_right_hand is not None:
+                                rh = effective_alpha * raw_rh + (1.0 - effective_alpha) * prev_right_hand
+                            else:
+                                rh = raw_rh
+                            # EMA history stays offset-free so the shift is not re-applied each tick.
+                            prev_right_hand = rh
+                            if right_hand_offset is not None:
+                                rh = rh + right_hand_offset
+                            err = right_hand.set_joint_position(rh.tolist(), False)
+                            if err is not None and getattr(err, "code", 0) != 0:
+                                logger.warning(f"right hand error t={t}: {err.message}")
+
+                    if hand_log is not None:
+                        hand_log.record_tick(
+                            episode, chunk_idx, t, steps_executed,
+                            raw_rh, rh,
+                            read_hand_state(right_hand) if right_hand is not None else None,
+                            raw_lh, lh,
+                            read_hand_state(left_hand) if left_hand is not None else None,
+                            arm_q_target,
+                            arm_ctrl.get_current_dual_arm_q() if arm_ctrl is not None else None,
+                        )
+
+                    elapsed = time.perf_counter() - t0
+                    time.sleep(max(0.0, dt - elapsed))
+                    steps_executed += 1
+
+                logger.info(
+                    f"chunk done ({horizon} steps from start_step={start_step}), "
+                    f"total={steps_executed}/{args.steps}"
+                )
+
+                # Stash this chunk for cross-chunk blending at the next switch.
+                # prev_chunk_next_t is the step the chunk would have continued
+                # at if we hadn't switched (= start + horizon). Capped at
+                # chunk_len so old_remaining = 0 when we ran the whole chunk.
+                prev_chunk = action_chunk
+                prev_chunk_next_t = start_step + horizon
+
+            # Episode complete — pause inference so we don't waste cycles
+            # while the robot is going home.
+            if worker is not None:
+                worker.pause()
+
+            if hand_log is not None:
+                hand_log.flush(episode)
+            logger.info(f"Episode {episode} complete ({args.steps} steps). Going home...")
+            _go_home(arm_ctrl, left_hand, right_hand, hold_s=args.hold_s, arm_ik=arm_ik)
+            if init_state is not None:
+                _go_to_init_state(arm_ctrl, left_hand, right_hand, init_state,
+                                  hold_s=args.init_state_hold_s, arm_ik=arm_ik)
+
+    except KeyboardInterrupt:
+        logger.info("Stopped by user.")
+    finally:
+        if hand_log is not None:
+            try:
+                hand_log.flush(episode)
+            except Exception as e:
+                logger.warning(f"hand log flush failed: {e}")
+        if worker is not None:
+            try:
+                worker.stop()
+            except Exception as e:
+                logger.warning(f"async worker stop failed: {e}")
+        _go_home(arm_ctrl, left_hand, right_hand, hold_s=args.hold_s, arm_ik=arm_ik)
+        _teardown_hands(args, left_hand, right_hand)
+        try:
+            img_client.close()
+        except Exception:
+            pass
+        logger.info("Done.")
+
+
+def parse_args():
+    ap = argparse.ArgumentParser(
+        description="H2 + Sharpa real-robot eval using a remote GR00T policy server.")
+    ap.add_argument("--check", action="store_true",
+                    help="Check mode: verify camera inputs only, skip arm/hands/GR00T")
+    ap.add_argument("--policy-host",   default="localhost",      help="GR00T server host")
+    ap.add_argument("--policy-port",   type=int, default=5555,   help="GR00T server port")
+    ap.add_argument("--timeout-ms",    type=int, default=15000,  help="ZMQ recv timeout ms")
+    ap.add_argument("--task",          default="",               help="Language instruction for the policy")
+    ap.add_argument("--img-server-ip", default="192.168.124.162", help="Image server IP")
+    ap.add_argument("--frequency",     type=float, default=30.0, help="Control frequency Hz")
+    ap.add_argument("--action-horizon", type=int, default=16,  # matches training delta_indices=[0..15]
+                    help="Number of steps to execute per action chunk before re-querying")
+    ap.add_argument("--steps", type=int, default=30,
+                    help="Total number of control steps to run before stopping (default: 30)")
+
+    # Hand and arm enable/disable
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--hands",    dest="hands", action="store_true",  default=True)
+    g.add_argument("--no-hands", dest="hands", action="store_false")
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--arm",      dest="arm",   action="store_true",  default=True)
+    g.add_argument("--no-arm",   dest="arm",   action="store_false")
+
+    # Image source: native DDS (default), ROS 2, or legacy ZMQ teleimager.
+    ap.add_argument("--image-source", choices=["dds", "ros", "zmq"], default="dds",
+                    help="Camera source. 'dds' = native JPEG topics from Thor; "
+                         "'ros' = sensor_msgs/Image topics; 'zmq' = legacy teleimager. "
+                         "Default: dds.")
+    ap.add_argument("--camera-dds-domain", type=int, default=10,
+                    help="Native camera DDS domain; separate from robot domain 0. Default: 10.")
+    ap.add_argument("--camera-network-interface", default=None,
+                    help="Optional NIC name used for native camera DDS discovery.")
+    ap.add_argument("--head-eye", choices=["left", "right", "both"], default="left",
+                    help="Physical head camera that fills the policy key video.head_right. "
+                         "The key name is fixed by the trained model; this flag only picks "
+                         "left vs right eye. Default: left (matches trocar_ego-style datasets "
+                         "that store the left-eye view under observation.images.head_right). "
+                         "'both' is treated as right.")
+    ap.add_argument("--cam-warmup-s", type=float, default=5.0,
+                    help="How long to wait for the first frame from each camera (default: 5s).")
+    ap.add_argument("--swap-wrist-cams", action="store_true",
+                    help="Swap left/right wrist camera streams. Use this when the physical "
+                         "wiring puts the wrist cameras on the wrong sides — fixes the "
+                         "observation at the eval-script layer without re-recording.")
+    ap.add_argument("--video-key-head", default="head_right", metavar="KEY",
+                    help="Policy video modality key that receives the head camera "
+                         "(see the checkpoint's processor_config.json video modality_keys). "
+                         "tele_0831 checkpoints: head_right; trocar_cotrain_gr00t checkpoints: high. "
+                         "Default: head_right.")
+    ap.add_argument("--video-key-wrist-left", default="wrist_left", metavar="KEY",
+                    help="Policy video key for the left wrist camera. cotrain: left_wrist_view. "
+                         "Default: wrist_left.")
+    ap.add_argument("--video-key-wrist-right", default="wrist_right", metavar="KEY",
+                    help="Policy video key for the right wrist camera. cotrain: right_wrist_view. "
+                         "Default: wrist_right.")
+
+    # Sharpa hands source: through the C++ DDS bridge on Thor or direct SDK locally.
+    ap.add_argument("--hands-source", choices=["dds", "sdk"], default="dds",
+                    help="How to drive Sharpa hands. 'dds' = publish HandCmd_ to "
+                         "rt/sharpa/{left,right}/cmd via sharpa_dds_bridge on Thor. "
+                         "'sdk' = direct Sharpa SDK locally (bridge must be stopped). "
+                         "Default: dds.")
+    ap.add_argument("--dds-domain", type=int, default=0,
+                    help="DDS domain ID for the arm controller and DDS-bridge hand client.")
+    ap.add_argument("--network-interface", default=None, metavar="IFACE",
+                    help="Network interface for the arm/hand DDS (rt/lowstate, rt/arm_sdk, "
+                         "rt/sharpa/*), e.g. eno2. Default: CycloneDDS auto-select, which "
+                         "picks the wrong NIC on multi-interface hosts. Cameras use "
+                         "--camera-network-interface separately.")
+
+    # H2 motion mode for standing replay (publish to rt/arm_sdk so WBC yields arms).
+    ap.add_argument("--motion", action="store_true",
+                    help="Enable H2 motion mode (publish on rt/arm_sdk with handover weight=1). "
+                         "Required when the robot is standing on its legs.")
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument(
+        "--gravity-comp",
+        dest="gravity_comp",
+        action="store_true",
+        default=False,
+        help="Feed Pinocchio RNEA gravity torque (tau_ff = G(q)), matching teleop. "
+             "Off by default; pass this flag to enable.",
+    )
+    g.add_argument(
+        "--no-gravity-comp",
+        dest="gravity_comp",
+        action="store_false",
+        help="Disable gravity compensation and send tau_ff = 0 (default).",
+    )
+    ap.add_argument("--head-pitch-home", type=float, default=0.6, metavar="RAD",
+                    help="H2 head pitch held during inference (radians). "
+                         "Range -0.523 (up) to 0.837 (down). Default: 0.6.")
+
+    # Hold timing
+    ap.add_argument("--hold-s", type=int, default=20,
+                    help="Seconds to hold at home before/between/after inference. Default: 20.")
+
+    # Output smoothing — EMA on the per-step policy action.
+    # 1.0 disables smoothing (raw); 0.3 - 0.6 is a typical range for noisy policies.
+    ap.add_argument("--smooth-alpha", type=float, default=1.0,
+                    help="EMA blend factor for action smoothing: target = alpha*raw + "
+                         "(1-alpha)*prev. 1.0 = no smoothing (default). 0.3-0.6 quiets "
+                         "high-frequency jitter from noisier models at the cost of mild lag.")
+
+    # Optional: start each episode from a recorded average-initial-state YAML
+    # produced by teleop/utils/compute_average_initial_state.py.
+    ap.add_argument("--init-state-yaml", type=str, default=None,
+                    help="Path to a YAML file with the average initial state "
+                         "(states.left_arm.qpos, ...left_ee.qpos, etc.). When provided, the "
+                         "robot moves to that posture after going home, before inference each "
+                         "episode. Body waist is ignored (read-only on H2).")
+    ap.add_argument("--init-state-hold-s", type=int, default=3,
+                    help="Seconds to hold the init posture before starting/resuming inference. "
+                         "Default: 3.")
+    ap.add_argument("--hand-log-dir", default=None, metavar="DIR",
+                    help="Record per-tick hand targets (server output, commanded, measured) "
+                         "and arm q into DIR/<timestamp>/ep<N>_hand_log.npz + "
+                         "ep<N>_right_hand.csv. Analyse with analyze_right_hand_log.py.")
+    ap.add_argument("--right-hand-offset-json", default=None, metavar="JSON",
+                    help="Add offset_needed_tele_minus_model from this JSON "
+                         "(analyze_right_hand_log.py output) to the absolute right-hand target "
+                         "received from the server, before sending it to the hand. The state "
+                         "fed to the model is not changed.")
+    ap.add_argument("--right-hand-offset-fingers", default="thumb,index,middle", metavar="LIST",
+                    help="Comma-separated fingers the offset applies to "
+                         "(thumb,index,middle,ring,pinky). Default: thumb,index,middle.")
+    ap.add_argument("--right-hand-offset-scale", type=float, default=1.0,
+                    help="Multiply the offset by this factor (e.g. 0.5 to start gently). Default: 1.0.")
+    ap.add_argument("--right-hand-offset-mode", choices=["all", "flex-only"], default="flex-only",
+                    help="flex-only (default) = keep only components that close the hand further "
+                         "(positive values on flexion joints; abduction joints untouched); "
+                         "all = apply the full per-joint offset (matches the teleop pose, which "
+                         "opens the knuckles).")
+
+    # H2 PD gains
+    ap.add_argument("--kp-low",   type=float, default=None)
+    ap.add_argument("--kp-wrist", type=float, default=None)
+    ap.add_argument("--kd-low",   type=float, default=None)
+    ap.add_argument("--kd-wrist", type=float, default=None)
+
+    # Sharpa SDK tuning (only used when --hands-source sdk)
+    ap.add_argument("--hand-speed-coeff",   type=float, default=0.5)
+    ap.add_argument("--hand-current-coeff", type=float, default=0.6)
+
+    # Async policy mode — run GR00T inference in a background thread so the
+    # robot keeps executing while the next chunk is being computed. At each
+    # chunk boundary, snap to the latest cached chunk and resume from a
+    # time-aligned start_step (skip steps that already elapsed during
+    # inference). Off by default to preserve the sync baseline.
+    ap.add_argument("--async-policy", action="store_true",
+                    help="Run GR00T inference concurrently with action execution.")
+    ap.add_argument("--async-cache-poll-s", type=float, default=0.005,
+                    help="How often the main loop polls for a fresh cached chunk "
+                         "when blocked between chunks. Default: 5 ms.")
+
+    # Boundary smoothing — heavier EMA blend for the first few ticks after
+    # each chunk switch, to mask the discontinuity between two independently-
+    # sampled chunks (diffusion noise + slightly different observations).
+    # Default 1.0 / 0 steps = no boundary smoothing (matches old behavior).
+    ap.add_argument("--boundary-smooth-alpha", type=float, default=1.0,
+                    help="EMA alpha to use *only* during the first N ticks after "
+                         "a chunk switch (where N = --boundary-smooth-steps). "
+                         "Lower = stronger crossfade. Typical: 0.3.")
+    ap.add_argument("--boundary-smooth-steps", type=int, default=0,
+                    help="Number of consumer ticks at the start of each new chunk "
+                         "during which --boundary-smooth-alpha replaces "
+                         "--smooth-alpha. Typical: 3-6. 0 disables.")
+
+    # Boundary blend — chunk-pair crossfade using the OLD chunk's still-unused
+    # future steps. At a chunk switch, the two chunks' overlap steps describe
+    # predictions for the SAME wall-clock time, so we linearly blend them
+    # from "mostly old" → "mostly new" over N steps. Requires the model to
+    # produce chunks longer than the action_horizon (otherwise the old
+    # chunk has no unused future steps to blend with).
+    ap.add_argument("--boundary-blend-steps", type=int, default=0,
+                    help="Number of cross-chunk blend steps at each boundary. "
+                         "Pairs old chunk's unexecuted future steps with new "
+                         "chunk's leading steps and exponentially fades from "
+                         "old to new. Typical: 5-8. Requires "
+                         "chunk_len > action_horizon. 0 disables.")
+    ap.add_argument("--boundary-blend-alpha", type=float, default=2.0,
+                    help="Exponential decay rate for the cross-chunk blend. "
+                         "Per-step old-chunk weight: w_old(t) = exp(-alpha * t / N) "
+                         "where t is the step offset and N = --boundary-blend-steps. "
+                         "Step 0: w_old=1.0 (pure old chunk). Step N: w_old=exp(-alpha). "
+                         "Larger alpha → faster fade-out. Typical: 1.5-4.0. Default: 2.0.")
+    return ap.parse_args()
+
+
+if __name__ == "__main__":
+    eval_h2_groot(parse_args())

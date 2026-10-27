@@ -63,6 +63,7 @@ class JsonDataset:
         self.json_state_data_name = ROBOT_CONFIGS[robot_type].json_state_data_name
         self.json_action_data_name = ROBOT_CONFIGS[robot_type].json_action_data_name
         self.camera_to_image_key = ROBOT_CONFIGS[robot_type].camera_to_image_key
+        self.head_joint_names = ROBOT_CONFIGS[robot_type].head_joint_names
 
     def _init_paths(self) -> None:
         """Initialize episode and task paths."""
@@ -132,6 +133,17 @@ class JsonDataset:
             result.append(data_array)
         return np.array(result)
 
+    def _extract_head(self, episode_data: dict) -> np.ndarray:
+        """Extract head joint states (e.g. pitch, yaw) from states.body.qpos by joint name."""
+        body_names = episode_data["info"]["joint_names"]["body"]
+        missing = [n for n in self.head_joint_names if n not in body_names]
+        if missing:
+            raise ValueError(f"head joints {missing} not recorded in body joint names {body_names}")
+        idx = [body_names.index(n) for n in self.head_joint_names]
+        return np.array(
+            [np.asarray(s["states"]["body"]["qpos"], dtype=np.float32)[idx] for s in episode_data["data"]]
+        )
+
     def _parse_images(self, episode_path: str, episode_data) -> dict[str, list[np.ndarray]]:
         """Load and stack images for a given camera key."""
 
@@ -179,6 +191,8 @@ class JsonDataset:
         state_dim = state.shape[1] if len(state.shape) == 2 else state.shape[0]
         action_dim = action.shape[1] if len(action.shape) == 2 else state.shape[0]
 
+        head = self._extract_head(episode_data) if self.head_joint_names else None
+
         # Load task description
         task = episode_data.get("text", {}).get("goal", "")
 
@@ -200,6 +214,7 @@ class JsonDataset:
             "episode_length": episode_length,
             "state": state,
             "action": action,
+            "head": head,
             "cameras": cameras,
             "task": task,
             "data_cfg": data_cfg,
@@ -253,6 +268,14 @@ def create_empty_dataset(
             ],
         }
 
+    head_joints = ROBOT_CONFIGS[robot_type].head_joint_names
+    if head_joints:
+        features["observation.head"] = {
+            "dtype": "float32",
+            "shape": (len(head_joints),),
+            "names": [head_joints],
+        }
+
     for cam in cameras:
         features[f"observation.images.{cam}"] = {
             "dtype": mode,
@@ -301,6 +324,9 @@ def populate_dataset(
                 "observation.state": state[i],
                 "action": action[i],
             }
+
+            if episode["head"] is not None:
+                frame["observation.head"] = episode["head"][i]
 
             for camera, img_array in cameras.items():
                 frame[f"observation.images.{camera}"] = img_array[i]

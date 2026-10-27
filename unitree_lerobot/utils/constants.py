@@ -8,6 +8,9 @@ class RobotConfig:
     camera_to_image_key: dict[str, str]
     json_state_data_name: list[str]
     json_action_data_name: list[str]
+    # Joints recorded under states.body.qpos that are exported as a separate state-only feature
+    # `observation.head` (looked up by name in the episode's info.joint_names.body).
+    head_joint_names: list[str] = dataclasses.field(default_factory=list)
 
 
 Z1_CONFIG = RobotConfig(
@@ -91,6 +94,7 @@ G1_DEX1_CONFIG = RobotConfig(
     },
     json_state_data_name=["left_arm.qpos", "right_arm.qpos", "left_ee.qpos", "right_ee.qpos"],
     json_action_data_name=["left_arm.qpos", "right_arm.qpos", "left_ee.qpos", "right_ee.qpos"],
+    head_joint_names=["head_pitch", "head_yaw"],
 )
 
 
@@ -487,6 +491,116 @@ UNIARML1_CONFIG = RobotConfig(
     json_action_data_name=["arm.qpos", "gripper.qpos"],
 )
 
+H2_CONFIG = RobotConfig(
+    motors=[
+        "kLeftShoulderPitch",
+        "kLeftShoulderRoll",
+        "kLeftShoulderYaw",
+        "kLeftElbow",
+        "kLeftWristRoll",
+        "kLeftWristPitch",
+        "kLeftWristyaw",
+        "kRightShoulderPitch",
+        "kRightShoulderRoll",
+        "kRightShoulderYaw",
+        "kRightElbow",
+        "kRightWristRoll",
+        "kRightWristPitch",
+        "kRightWristYaw",
+    ],
+    cameras=[
+        "cam_high",
+        "cam_left_wrist",
+        "cam_right_wrist",
+    ],
+    camera_to_image_key={"color_0": "cam_high", "color_1": "cam_left_wrist", "color_2": "cam_right_wrist"},
+    json_state_data_name=["left_arm.qpos", "right_arm.qpos"],
+    json_action_data_name=["left_arm.qpos", "right_arm.qpos"],
+)
+
+
+H2_SHARPA_CONFIG = RobotConfig(
+    motors=[
+        # H2 arms (14)
+        "kLeftShoulderPitch",
+        "kLeftShoulderRoll",
+        "kLeftShoulderYaw",
+        "kLeftElbow",
+        "kLeftWristRoll",
+        "kLeftWristPitch",
+        "kLeftWristYaw",
+        "kRightShoulderPitch",
+        "kRightShoulderRoll",
+        "kRightShoulderYaw",
+        "kRightElbow",
+        "kRightWristRoll",
+        "kRightWristPitch",
+        "kRightWristYaw",
+        # Sharpa left hand (22)
+        "left_thumb_CMC_FE",
+        "left_thumb_CMC_AA",
+        "left_thumb_MCP_FE",
+        "left_thumb_MCP_AA",
+        "left_thumb_IP",
+        "left_index_MCP_FE",
+        "left_index_MCP_AA",
+        "left_index_PIP",
+        "left_index_DIP",
+        "left_middle_MCP_FE",
+        "left_middle_MCP_AA",
+        "left_middle_PIP",
+        "left_middle_DIP",
+        "left_ring_MCP_FE",
+        "left_ring_MCP_AA",
+        "left_ring_PIP",
+        "left_ring_DIP",
+        "left_pinky_CMC",
+        "left_pinky_MCP_FE",
+        "left_pinky_MCP_AA",
+        "left_pinky_PIP",
+        "left_pinky_DIP",
+        # Sharpa right hand (22)
+        "right_thumb_CMC_FE",
+        "right_thumb_CMC_AA",
+        "right_thumb_MCP_FE",
+        "right_thumb_MCP_AA",
+        "right_thumb_IP",
+        "right_index_MCP_FE",
+        "right_index_MCP_AA",
+        "right_index_PIP",
+        "right_index_DIP",
+        "right_middle_MCP_FE",
+        "right_middle_MCP_AA",
+        "right_middle_PIP",
+        "right_middle_DIP",
+        "right_ring_MCP_FE",
+        "right_ring_MCP_AA",
+        "right_ring_PIP",
+        "right_ring_DIP",
+        "right_pinky_CMC",
+        "right_pinky_MCP_FE",
+        "right_pinky_MCP_AA",
+        "right_pinky_PIP",
+        "right_pinky_DIP",
+    ],
+    cameras=[
+        "cam_left_high",
+        "cam_right_high",
+        "cam_left_wrist",
+        "cam_right_wrist",
+    ],
+    camera_to_image_key={
+        "color_0": "cam_left_high",
+        "color_1": "cam_right_high",
+        "color_2": "cam_left_wrist",
+        "color_3": "cam_right_wrist",
+    },
+    json_state_data_name=["left_arm.qpos", "right_arm.qpos", "left_ee.qpos", "right_ee.qpos"],
+    json_action_data_name=["left_arm.qpos", "right_arm.qpos", "left_ee.qpos", "right_ee.qpos"],
+    head_joint_names=["head_pitch", "head_yaw"],
+)
+
+
 ROBOT_CONFIGS = {
     "Unitree_Z1_Single": Z1_SINGLE_CONFIG,
     "Unitree_Z1_Dual": Z1_CONFIG,
@@ -500,4 +614,6 @@ ROBOT_CONFIGS = {
     "Unitree_G1_Lift_Dex1_UseWaist": LIFT_G1_DEX1_USEWAIST_CONFIG,
     "Unitree_G1_Lift_Dex1_NoUseWaist": LIFT_G1_DEX1_NOUSEWAIST_CONFIG,
     "Unitree_Arm_L1": UNIARML1_CONFIG,
+    "Unitree_H2": H2_CONFIG,
+    "Unitree_H2_Sharpa": H2_SHARPA_CONFIG,
 }
